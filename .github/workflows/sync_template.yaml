@@ -28,3 +28,46 @@ jobs:
           template_sync_ignore_file_path: .github/.templatesyncignore
           is_force_deletion: true
           git_remote_pull_params: --allow-unrelated-histories --strategy=recursive --no-edit -X diff-algorithm=minimal -X ignore-all-space -X patience -X renormalize
+
+      # ==================================================================
+      # 以下为本地新增：actions-template-sync 只会开 PR，不会自动合并。
+      # GitHub 原生的 Enable auto-merge 对「可立即合并」的 PR 不生效
+      # （官方文档：only shown on PRs that cannot be merged immediately），
+      # 而本仓库的同步 PR 永远是可立即合并状态，所以只能在这里主动合并。
+      #
+      # 本文件在 .github/.templatesyncignore 中，上游同步不会覆盖本改动。
+      # ==================================================================
+      - name: Merge the sync PR if it is mergeable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: '[bot] 同步模板仓库的更新'
+        run: |
+          set -euo pipefail
+
+          # 按标题匹配而非分支名：分支名带当日 sha，每天都变
+          PR=$(gh pr list --state open --json number,title \
+            --jq '.[] | select(.title == env.PR_TITLE) | .number' | sort -n | tail -n 1)
+
+          if [ -z "$PR" ]; then
+            echo "没有待合并的同步 PR"
+            exit 0
+          fi
+
+          echo "发现同步 PR #$PR"
+
+          # UNKNOWN 表示 GitHub 还在算，稍等后重试
+          for attempt in 1 2 3; do
+            MERGEABLE=$(gh pr view "$PR" --json mergeable --jq '.mergeable')
+            [ "$MERGEABLE" = "UNKNOWN" ] || break
+            echo "合并状态未知，第 $attempt 次重试"
+            sleep 5
+          done
+
+          if [ "$MERGEABLE" != "MERGEABLE" ]; then
+            gh pr comment "$PR" --body "同步 PR 状态为 \`$MERGEABLE\`（通常是存在冲突），已跳过自动合并，请手动处理：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$PR"
+            echo "PR #$PR 不可合并（$MERGEABLE），已留言并跳过"
+            exit 0
+          fi
+
+          gh pr merge "$PR" --merge --delete-branch
+          echo "已合并 PR #$PR，main 的 bundle workflow 会自动重建 dist"
